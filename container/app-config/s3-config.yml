@@ -1,0 +1,33 @@
+# S3 file-mapping driver for the Gapwalk S3FileHandler (faithful reference).
+# Maps each logical DD name to an S3 key + local file. The handler prepends
+# S3_PREFIX (testRunPrefix) to every key when set, so test runs are isolated.
+s3:
+  region: ${AWS_REGION}          # injected by the ECS task
+  bucket: ${S3_BUCKET}           # injected by the ECS task
+  prefix: ${S3_PREFIX}           # testRunPrefix; empty in production
+  localTempDir: /opt/tomcat/workdir/input-files
+  cleanupAfterProcessing: true
+
+# One block per job (the Groovy calls downloadInputFilesForJob("JOB1") etc.).
+fileMappings:
+  JOB1:
+    inputs:
+      - { dd: TXNIN,   s3Key: "inbound/transactions/",   localFileName: txns.input,      recordSize: 80 }
+    outputs:
+      - { dd: NORMOUT, s3Key: "processing/JOB1/output/", localFileName: normalized.csv,  recordSize: 80 }
+  JOB2A:
+    inputs:
+      - { dd: NORMIN,  s3Key: "processing/JOB1/output/", localFileName: normalized.csv,  recordSize: 80 }
+    outputs:
+      - { dd: FEEOUT,  s3Key: "processing/JOB2A/output/", localFileName: fees.csv,       recordSize: 80 }
+  JOB2B:
+    inputs:
+      - { dd: NORMIN,  s3Key: "processing/JOB1/output/", localFileName: normalized.csv,  recordSize: 80 }
+    outputs:
+      - { dd: REBOUT,  s3Key: "processing/JOB2B/output/", localFileName: rebates.csv,    recordSize: 80 }
+  JOB3:
+    inputs:
+      - { dd: FEEIN,   s3Key: "processing/JOB2A/output/", localFileName: fees.csv,       recordSize: 80 }
+      - { dd: REBIN,   s3Key: "processing/JOB2B/output/", localFileName: rebates.csv,    recordSize: 80 }
+    outputs:
+      - { dd: SUMOUT,  s3Key: "outbound/",                localFileName: summary.csv,    recordSize: 120 }

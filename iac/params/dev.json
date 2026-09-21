@@ -1,0 +1,21 @@
+{
+  "_comment": "Per-environment parameter values consumed by the deploy script (see README.md). Replace <...> placeholders. Same ASL/templates promote to test/prod by adding test.json / prod.json.",
+  "EnvName": "dev",
+  "Region": "<REGION_ID>",
+  "S3PrefixListId": "<pl-xxxx : aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.<REGION_ID>.s3 --query PrefixLists[0].PrefixListId --output text>",
+
+  "ContainerImage": "<account-id>.dkr.ecr.<REGION_ID>.amazonaws.com/batch-stub:latest",
+
+  "LambdaCodeBucket": "<artifact-bucket>",
+  "FileCheckKey": "lambda/file_check.zip",
+  "CalendarCheckKey": "lambda/calendar_check.zip",
+  "MaxAgeDays": "2",
+
+  "DefinitionBucket": "<artifact-bucket>",
+  "OrchestratorKey": "statemachine/batch-orchestrator.asl.json",
+  "ScheduleExpression": "cron(0 2 * * ? *)",
+  "ScheduleTimezone": "<TIMEZONE>",
+
+  "OpsEmail": "batch-ops@example.com",
+  "SlaDurationMillis": 1800000
+}

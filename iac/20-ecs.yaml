@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch orchestration - ECS. Fargate cluster, one shared task definition
+  used by every job (program chosen via Command override), and a log group. Point
+  ContainerImage at either your Blu Age/Gapwalk image or the runnable stub image.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  ContainerImage:
+    Type: String
+    Description: ECR image URI (runnable-stub for a sandbox run, or your transformed image).
+  TaskCpu:
+    Type: String
+    Default: '1024'      # 1 vCPU
+  TaskMemory:
+    Type: String
+    Default: '2048'      # 2 GB
+  CpuArchitecture:
+    Type: String
+    Default: X86_64      # MUST match how the image was built. GitHub runners build
+    AllowedValues: [X86_64, ARM64]   # X86_64; Apple Silicon builds ARM64 (use buildx --platform).
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub batch-${EnvName}
+      CapacityProviders: [FARGATE]
+      ClusterSettings:
+        - Name: containerInsights   # per-task CPU/memory/network metrics for ops visibility
+          Value: enabled
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/batch-${EnvName}
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub batch-${EnvName}-jobs
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: !Ref CpuArchitecture
+      ExecutionRoleArn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-ecs-exec-role' }
+      TaskRoleArn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-ecs-task-role' }
+      ContainerDefinitions:
+        - Name: batch-job          # == ${CONTAINER_NAME} in the ASL
+          Image: !Ref ContainerImage
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: batch
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-cluster-arn' }
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+    Export: { Name: !Sub 'batch-${EnvName}-taskdef-arn' }
+  ContainerName:
+    Value: batch-job
+    Export: { Name: !Sub 'batch-${EnvName}-container-name' }

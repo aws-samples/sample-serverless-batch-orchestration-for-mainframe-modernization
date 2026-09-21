@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch orchestration - foundation. S3 data layer with inbound/processing/
+  outbound prefixes, VPC with two private subnets, S3 gateway endpoint, interface
+  endpoints for ECR + CloudWatch Logs, and the ECS task security group.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  S3PrefixListId:
+    Type: String
+    Description: >
+      The S3 managed prefix list ID for this region, used to scope task egress to
+      S3 (no open 0.0.0.0/0 rule). Find it with:
+      aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.<region>.s3 --query 'PrefixLists[0].PrefixListId'
+    AllowedPattern: '^pl-[0-9a-f]+$'
+
+Resources:
+  BatchBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub batch-data-${EnvName}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled          # overwrite traceability; supports idempotent Redrive
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256   # SSE-S3; swap for aws:kms + a CMK if you need key control
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTierProcessing
+            Status: Enabled
+            Prefix: processing/
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+
+  # Deny any non-TLS access to the bucket.
+  BatchBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BatchBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BatchBucket.Arn
+              - !Sub '${BatchBucket.Arn}/*'
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub 'batch-${EnvName}-vpc' }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub 'batch-${EnvName}-private-a' }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub 'batch-${EnvName}-private-b' }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # Egress-only, scoped to the VPC endpoints — no open internet path (no NAT).
+  # The inline egress rule REPLACES CloudFormation's default allow-all 0.0.0.0/0.
+  # The interface-endpoint rule is a separate resource to avoid a circular
+  # dependency with EndpointSecurityGroup (which ingresses from this SG).
+  EcsTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Batch ECS Fargate tasks - egress to VPC endpoints only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+          Description: HTTPS to S3 via the gateway endpoint managed prefix list
+
+  EcsTaskEgressToEndpoints:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Description: HTTPS to ECR/Logs interface endpoints
+
+  # S3 gateway endpoint (free, no ENI) — lets tasks reach S3 without NAT.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # Interface endpoints so Fargate can pull images + write logs in private subnets.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC interface endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EcsTaskSecurityGroup
+          Description: HTTPS from ECS tasks to the interface endpoints
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+Outputs:
+  BucketName:
+    Value: !Ref BatchBucket
+    Export: { Name: !Sub 'batch-${EnvName}-bucket' }
+  BucketArn:
+    Value: !GetAtt BatchBucket.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-bucket-arn' }
+  SubnetA:
+    Value: !Ref PrivateSubnetA
+    Export: { Name: !Sub 'batch-${EnvName}-subnet-a' }
+  SubnetB:
+    Value: !Ref PrivateSubnetB
+    Export: { Name: !Sub 'batch-${EnvName}-subnet-b' }
+  SecurityGroup:
+    Value: !Ref EcsTaskSecurityGroup
+    Export: { Name: !Sub 'batch-${EnvName}-sg' }

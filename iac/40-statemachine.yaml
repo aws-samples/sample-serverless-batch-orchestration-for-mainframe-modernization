@@ -1,0 +1,88 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch orchestration - Step Functions + EventBridge Scheduler. The
+  ASL is loaded from S3 and its ${...} tokens are resolved via DefinitionSubstitutions
+  so the same definition promotes unchanged across environments.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  DefinitionBucket:
+    Type: String
+    Description: S3 bucket holding the ASL JSON (uploaded by the deploy script).
+  OrchestratorKey:
+    Type: String
+    Default: statemachine/batch-orchestrator.asl.json
+  RegressionKey:
+    Type: String
+    Default: statemachine/regression-test.asl.json
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 2 * * ? *)     # daily 02:00
+  ScheduleTimezone:
+    Type: String
+    Default: UTC
+
+Resources:
+  BatchStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub batch-${EnvName}-orchestrator
+      StateMachineType: STANDARD       # required for history, long runs, and Redrive
+      RoleArn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-sfn-role' }
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionBucket
+        Key: !Ref OrchestratorKey
+      DefinitionSubstitutions:
+        INPUT_FILE_CHECK_LAMBDA: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-file-check-arn' }
+        CALENDAR_CHECK_LAMBDA:   !ImportValue { 'Fn::Sub': 'batch-${EnvName}-calendar-check-arn' }
+        ECS_CLUSTER_ARN:         !ImportValue { 'Fn::Sub': 'batch-${EnvName}-cluster-arn' }
+        TASK_DEFINITION_ARN:     !ImportValue { 'Fn::Sub': 'batch-${EnvName}-taskdef-arn' }
+        CONTAINER_NAME:          !ImportValue { 'Fn::Sub': 'batch-${EnvName}-container-name' }
+        SUBNET_ID_A:             !ImportValue { 'Fn::Sub': 'batch-${EnvName}-subnet-a' }
+        SUBNET_ID_B:             !ImportValue { 'Fn::Sub': 'batch-${EnvName}-subnet-b' }
+        SECURITY_GROUP_ID:       !ImportValue { 'Fn::Sub': 'batch-${EnvName}-sg' }
+        S3_BUCKET:               !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket' }
+        AWS_REGION:              !Ref AWS::Region
+
+  # Regression harness — same substitutions minus the calendar gate.
+  RegressionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub batch-${EnvName}-regression
+      StateMachineType: STANDARD
+      RoleArn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-sfn-role' }
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionBucket
+        Key: !Ref RegressionKey
+      DefinitionSubstitutions:
+        INPUT_FILE_CHECK_LAMBDA: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-file-check-arn' }
+        ECS_CLUSTER_ARN:         !ImportValue { 'Fn::Sub': 'batch-${EnvName}-cluster-arn' }
+        TASK_DEFINITION_ARN:     !ImportValue { 'Fn::Sub': 'batch-${EnvName}-taskdef-arn' }
+        CONTAINER_NAME:          !ImportValue { 'Fn::Sub': 'batch-${EnvName}-container-name' }
+        SUBNET_ID_A:             !ImportValue { 'Fn::Sub': 'batch-${EnvName}-subnet-a' }
+        SUBNET_ID_B:             !ImportValue { 'Fn::Sub': 'batch-${EnvName}-subnet-b' }
+        SECURITY_GROUP_ID:       !ImportValue { 'Fn::Sub': 'batch-${EnvName}-sg' }
+        S3_BUCKET:               !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket' }
+        AWS_REGION:              !Ref AWS::Region
+
+  BatchSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub batch-${EnvName}-trigger
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      Target:
+        Arn: !Ref BatchStateMachine
+        RoleArn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-scheduler-role' }
+        Input: '{}'                    # empty payload; SetDefaults handles it
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref BatchStateMachine
+    Export: { Name: !Sub 'batch-${EnvName}-statemachine-arn' }
+  RegressionStateMachineArn:
+    Value: !Ref RegressionStateMachine
+    Export: { Name: !Sub 'batch-${EnvName}-regression-arn' }

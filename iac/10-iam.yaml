@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch orchestration - IAM roles. Least-privilege roles for
+  Step Functions, ECS task execution, ECS task (app), the Lambdas, and EventBridge
+  Scheduler. Replaces RACF/ACF2.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+
+Resources:
+  # --- ECS task execution role (pull image, write logs) ---------------------
+  # Inline, ARN-scoped equivalent of the AWS-managed AmazonECSTaskExecutionRolePolicy.
+  # ecr:GetAuthorizationToken must be "*" (it is an account-level API that takes no
+  # resource); image pulls are scoped to the batch-stub repo, and log writes to the
+  # ECS log group created in iac/20-ecs.yaml.
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-task-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/batch-stub
+              - Sid: LogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/batch-${EnvName}:*
+
+  # --- ECS task (application) role: S3 access scoped to the batch bucket -----
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: batch-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub
+                  - '${Arn}/*'
+                  - Arn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket-arn' }
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket-arn' }
+
+  # --- File-check + calendar-check Lambda role -------------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        # Inline, ARN-scoped equivalent of AWSLambdaBasicExecutionRole: log writes
+        # limited to the two batch-${EnvName}-* Lambda log groups.
+        - PolicyName: lambda-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/batch-${EnvName}-*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/batch-${EnvName}-*:*
+        - PolicyName: file-check-s3-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetObject]
+                Resource:
+                  - !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket-arn' }
+                  - !Sub
+                    - '${Arn}/*'
+                    - Arn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket-arn' }
+
+  # --- Step Functions execution role -----------------------------------------
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-invoke-and-run
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:batch-*
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/batch-${EnvName}-jobs:*
+              - Effect: Allow
+                Action: [ecs:StopTask, ecs:DescribeTasks]
+                Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/batch-${EnvName}/*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt EcsExecutionRole.Arn, !GetAtt EcsTaskRole.Arn]
+              # RunTask.sync needs the managed EventBridge rule for task completion.
+              - Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule
+
+  # --- EventBridge Scheduler role: start the state machine -------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:batch-*
+
+Outputs:
+  EcsExecutionRoleArn:
+    Value: !GetAtt EcsExecutionRole.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-ecs-exec-role' }
+  EcsTaskRoleArn:
+    Value: !GetAtt EcsTaskRole.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-ecs-task-role' }
+  LambdaRoleArn:
+    Value: !GetAtt LambdaRole.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-lambda-role' }
+  StateMachineRoleArn:
+    Value: !GetAtt StateMachineRole.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-sfn-role' }
+  SchedulerRoleArn:
+    Value: !GetAtt SchedulerRole.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-scheduler-role' }

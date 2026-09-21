@@ -1,0 +1,94 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch orchestration - observability. SNS topic + alarms on failed
+  executions and SLA duration, plus a dashboard. Replaces Control-M EM / Shout.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  OpsEmail:
+    Type: String
+    Description: Address subscribed to failure / SLA alerts.
+  SlaDurationMillis:
+    Type: Number
+    Default: 1800000       # 30 min SLA
+
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub batch-${EnvName}-alerts
+      KmsMasterKeyId: alias/aws/sns   # encrypt at rest with the AWS-managed SNS key
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref OpsEmail
+
+  ExecutionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub batch-${EnvName}-executions-failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-statemachine-arn' }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  SlaBreachAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub batch-${EnvName}-sla-breach
+      Namespace: AWS/States
+      MetricName: ExecutionTime
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-statemachine-arn' }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref SlaDurationMillis
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub batch-${EnvName}
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Executions (succeeded vs failed)",
+                  "region": "${AWS::Region}",
+                  "metrics": [
+                    [ "AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${SmArn}" ],
+                    [ "AWS/States", "ExecutionsFailed", "StateMachineArn", "${SmArn}" ]
+                  ], "stat": "Sum", "period": 300 } },
+              { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+                "properties": {
+                  "title": "Execution duration",
+                  "region": "${AWS::Region}",
+                  "metrics": [ [ "AWS/States", "ExecutionTime", "StateMachineArn", "${SmArn}" ] ],
+                  "stat": "Maximum", "period": 300 } }
+            ]
+          }
+        - SmArn: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-statemachine-arn' }
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+    Export: { Name: !Sub 'batch-${EnvName}-alert-topic' }

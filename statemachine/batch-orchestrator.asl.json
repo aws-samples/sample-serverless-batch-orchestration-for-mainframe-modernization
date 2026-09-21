@@ -1,0 +1,315 @@
+{
+  "Comment": "Batch orchestrator - replaces a Control-M/CA7 job chain. Chain shape: JOB1 -> [JOB2A || JOB2B] -> JOB3. Each job is a Lambda file-check -> Choice -> ECS RunTask.sync -> Choice group. ${...} tokens are CloudFormation DefinitionSubstitutions resolved at deploy time (see iac/40-statemachine.yaml).",
+  "StartAt": "SetDefaults",
+  "States": {
+
+    "SetDefaults": {
+      "Type": "Pass",
+      "Comment": "Merge caller input over defaults so EventBridge (empty payload) and operators (testRunPrefix) both work.",
+      "Parameters": {
+        "defaults": { "testRunPrefix": "" },
+        "executionInput.$": "$$.Execution.Input"
+      },
+      "ResultPath": "$.init",
+      "Next": "MergeDefaults"
+    },
+    "MergeDefaults": {
+      "Type": "Pass",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($.init.defaults, $.init.executionInput, false)"
+      },
+      "ResultPath": "$.init",
+      "Next": "ExtractConfig"
+    },
+    "ExtractConfig": {
+      "Type": "Pass",
+      "Parameters": { "testRunPrefix.$": "$.init.merged.testRunPrefix" },
+      "ResultPath": "$.config",
+      "Next": "CalendarCheck"
+    },
+
+    "CalendarCheck": {
+      "Type": "Task",
+      "Comment": "Business-day gate. Replaces Control-M calendar. Returns { isBusinessDay: bool }.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CALENDAR_CHECK_LAMBDA}",
+        "Payload": { "date.$": "$$.Execution.StartTime" }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "LambdaExecutionError", "ResultPath": "$.error" }],
+      "ResultPath": "$.calendar",
+      "Next": "EvaluateBusinessDay"
+    },
+    "EvaluateBusinessDay": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.calendar.Payload.isBusinessDay", "BooleanEquals": true, "Next": "CheckJOB1InputFiles" }
+      ],
+      "Default": "NotABusinessDay"
+    },
+    "NotABusinessDay": {
+      "Type": "Succeed",
+      "Comment": "Non-processing day. Terminates cleanly - no failure alarm, no ops page."
+    },
+
+    "CheckJOB1InputFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${INPUT_FILE_CHECK_LAMBDA}",
+        "Payload": { "jobName": "Check_JOB1_Input_Files", "testRunPrefix.$": "$.config.testRunPrefix" }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "LambdaExecutionError", "ResultPath": "$.error" }],
+      "ResultPath": "$.job1InputChecks",
+      "Next": "EvaluateJOB1Files"
+    },
+    "EvaluateJOB1Files": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.job1InputChecks.Payload.allFilesPresent", "BooleanEquals": true, "Next": "RunJOB1ECSTask" }
+      ],
+      "Default": "FilesNotPresent"
+    },
+    "RunJOB1ECSTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "TimeoutSeconds": 7200,
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "Cluster": "${ECS_CLUSTER_ARN}",
+        "TaskDefinition": "${TASK_DEFINITION_ARN}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["${SUBNET_ID_A}", "${SUBNET_ID_B}"],
+            "SecurityGroups": ["${SECURITY_GROUP_ID}"],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "${CONTAINER_NAME}",
+              "Command": ["JOB1"],
+              "Environment": [
+                { "Name": "S3_BUCKET", "Value": "${S3_BUCKET}" },
+                { "Name": "AWS_REGION", "Value": "${AWS_REGION}" },
+                { "Name": "S3_PREFIX", "Value.$": "$.config.testRunPrefix" }
+              ]
+            }
+          ]
+        }
+      },
+      "Retry": [{ "ErrorEquals": ["ECS.AmazonECSException", "ECS.ServerException", "States.Timeout"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "BatchJobExecutionFailed", "ResultPath": "$.error" }],
+      "ResultPath": "$.job1EcsResult",
+      "Next": "EvaluateJOB1ExitCode"
+    },
+    "EvaluateJOB1ExitCode": {
+      "Type": "Choice",
+      "Comment": "Single-container task = index 0. The real Gapwalk image has a sidecar; there the app container is Containers[1]. Confirm against your task definition.",
+      "Choices": [
+        { "Variable": "$.job1EcsResult.Containers[0].ExitCode", "NumericEquals": 0, "Next": "RunParallelJobs" }
+      ],
+      "Default": "BatchJobExecutionFailed"
+    },
+
+    "RunParallelJobs": {
+      "Type": "Parallel",
+      "Comment": "Index 0 = JOB2A, Index 1 = JOB2B. Each branch catches its own failures and ends in a Pass state so one branch failing does not abort the other. Do not reorder branches without updating EvaluateParallelOutcomes.",
+      "ResultPath": "$.parallelResults",
+      "Branches": [
+        {
+          "StartAt": "CheckJOB2AInputFiles",
+          "States": {
+            "CheckJOB2AInputFiles": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${INPUT_FILE_CHECK_LAMBDA}",
+                "Payload": { "jobName": "Check_JOB2A_Input_Files", "testRunPrefix.$": "$.config.testRunPrefix" }
+              },
+              "Retry": [{ "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "JOB2AFilesNotPresent", "ResultPath": "$.error" }],
+              "ResultPath": "$.job2aInputChecks",
+              "Next": "EvaluateJOB2AFiles"
+            },
+            "EvaluateJOB2AFiles": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.job2aInputChecks.Payload.allFilesPresent", "BooleanEquals": true, "Next": "RunJOB2AECSTask" }],
+              "Default": "JOB2AFilesNotPresent"
+            },
+            "RunJOB2AECSTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "TimeoutSeconds": 7200,
+              "Parameters": {
+                "LaunchType": "FARGATE",
+                "Cluster": "${ECS_CLUSTER_ARN}",
+                "TaskDefinition": "${TASK_DEFINITION_ARN}",
+                "NetworkConfiguration": { "AwsvpcConfiguration": { "Subnets": ["${SUBNET_ID_A}", "${SUBNET_ID_B}"], "SecurityGroups": ["${SECURITY_GROUP_ID}"], "AssignPublicIp": "DISABLED" } },
+                "Overrides": { "ContainerOverrides": [{ "Name": "${CONTAINER_NAME}", "Command": ["JOB2A"], "Environment": [{ "Name": "S3_BUCKET", "Value": "${S3_BUCKET}" }, { "Name": "AWS_REGION", "Value": "${AWS_REGION}" }, { "Name": "S3_PREFIX", "Value.$": "$.config.testRunPrefix" }] }] }
+              },
+              "Retry": [{ "ErrorEquals": ["ECS.AmazonECSException", "ECS.ServerException", "States.Timeout"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "JOB2AFailed", "ResultPath": "$.error" }],
+              "ResultPath": "$.job2aEcsResult",
+              "Next": "EvaluateJOB2AExitCode"
+            },
+            "EvaluateJOB2AExitCode": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.job2aEcsResult.Containers[0].ExitCode", "NumericEquals": 0, "Next": "JOB2ASucceeded" }],
+              "Default": "JOB2AFailed"
+            },
+            "JOB2ASucceeded": { "Type": "Pass", "Result": { "status": "SUCCEEDED", "errorType": "NONE" }, "ResultPath": "$.job2aOutcome", "End": true },
+            "JOB2AFailed": { "Type": "Pass", "Result": { "status": "FAILED", "errorType": "ECS_TASK_FAILED" }, "ResultPath": "$.job2aOutcome", "End": true },
+            "JOB2AFilesNotPresent": { "Type": "Pass", "Result": { "status": "SKIPPED", "errorType": "INPUT_FILES_MISSING" }, "ResultPath": "$.job2aOutcome", "End": true }
+          }
+        },
+        {
+          "StartAt": "CheckJOB2BInputFiles",
+          "States": {
+            "CheckJOB2BInputFiles": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${INPUT_FILE_CHECK_LAMBDA}",
+                "Payload": { "jobName": "Check_JOB2B_Input_Files", "testRunPrefix.$": "$.config.testRunPrefix" }
+              },
+              "Retry": [{ "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "JOB2BFilesNotPresent", "ResultPath": "$.error" }],
+              "ResultPath": "$.job2bInputChecks",
+              "Next": "EvaluateJOB2BFiles"
+            },
+            "EvaluateJOB2BFiles": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.job2bInputChecks.Payload.allFilesPresent", "BooleanEquals": true, "Next": "RunJOB2BECSTask" }],
+              "Default": "JOB2BFilesNotPresent"
+            },
+            "RunJOB2BECSTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "TimeoutSeconds": 7200,
+              "Parameters": {
+                "LaunchType": "FARGATE",
+                "Cluster": "${ECS_CLUSTER_ARN}",
+                "TaskDefinition": "${TASK_DEFINITION_ARN}",
+                "NetworkConfiguration": { "AwsvpcConfiguration": { "Subnets": ["${SUBNET_ID_A}", "${SUBNET_ID_B}"], "SecurityGroups": ["${SECURITY_GROUP_ID}"], "AssignPublicIp": "DISABLED" } },
+                "Overrides": { "ContainerOverrides": [{ "Name": "${CONTAINER_NAME}", "Command": ["JOB2B"], "Environment": [{ "Name": "S3_BUCKET", "Value": "${S3_BUCKET}" }, { "Name": "AWS_REGION", "Value": "${AWS_REGION}" }, { "Name": "S3_PREFIX", "Value.$": "$.config.testRunPrefix" }] }] }
+              },
+              "Retry": [{ "ErrorEquals": ["ECS.AmazonECSException", "ECS.ServerException", "States.Timeout"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "JOB2BFailed", "ResultPath": "$.error" }],
+              "ResultPath": "$.job2bEcsResult",
+              "Next": "EvaluateJOB2BExitCode"
+            },
+            "EvaluateJOB2BExitCode": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.job2bEcsResult.Containers[0].ExitCode", "NumericEquals": 0, "Next": "JOB2BSucceeded" }],
+              "Default": "JOB2BFailed"
+            },
+            "JOB2BSucceeded": { "Type": "Pass", "Result": { "status": "SUCCEEDED", "errorType": "NONE" }, "ResultPath": "$.job2bOutcome", "End": true },
+            "JOB2BFailed": { "Type": "Pass", "Result": { "status": "FAILED", "errorType": "ECS_TASK_FAILED" }, "ResultPath": "$.job2bOutcome", "End": true },
+            "JOB2BFilesNotPresent": { "Type": "Pass", "Result": { "status": "SKIPPED", "errorType": "INPUT_FILES_MISSING" }, "ResultPath": "$.job2bOutcome", "End": true }
+          }
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "BatchJobExecutionFailed", "ResultPath": "$.error" }],
+      "Next": "EvaluateParallelOutcomes"
+    },
+    "EvaluateParallelOutcomes": {
+      "Type": "Choice",
+      "Comment": "A hard ECS failure in either branch is classified before the missing-files case, so a genuine JOB2x failure is never masked as InputFilesNotPresent when the other branch merely skipped on missing input.",
+      "Choices": [
+        {
+          "Or": [
+            { "Variable": "$.parallelResults[0].job2aOutcome.errorType", "StringEquals": "ECS_TASK_FAILED" },
+            { "Variable": "$.parallelResults[1].job2bOutcome.errorType", "StringEquals": "ECS_TASK_FAILED" }
+          ],
+          "Next": "BatchJobExecutionFailed"
+        },
+        {
+          "And": [
+            { "Variable": "$.parallelResults[0].job2aOutcome.status", "StringEquals": "SUCCEEDED" },
+            { "Variable": "$.parallelResults[1].job2bOutcome.status", "StringEquals": "SUCCEEDED" }
+          ],
+          "Next": "CheckJOB3InputFiles"
+        },
+        {
+          "Or": [
+            { "Variable": "$.parallelResults[0].job2aOutcome.errorType", "StringEquals": "INPUT_FILES_MISSING" },
+            { "Variable": "$.parallelResults[1].job2bOutcome.errorType", "StringEquals": "INPUT_FILES_MISSING" }
+          ],
+          "Next": "FilesNotPresent"
+        }
+      ],
+      "Default": "BatchJobExecutionFailed"
+    },
+
+    "CheckJOB3InputFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${INPUT_FILE_CHECK_LAMBDA}",
+        "Payload": { "jobName": "Check_JOB3_Input_Files", "testRunPrefix.$": "$.config.testRunPrefix" }
+      },
+      "Retry": [{ "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "LambdaExecutionError", "ResultPath": "$.error" }],
+      "ResultPath": "$.job3InputChecks",
+      "Next": "EvaluateJOB3Files"
+    },
+    "EvaluateJOB3Files": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.job3InputChecks.Payload.allFilesPresent", "BooleanEquals": true, "Next": "RunJOB3ECSTask" }],
+      "Default": "FilesNotPresent"
+    },
+    "RunJOB3ECSTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "TimeoutSeconds": 7200,
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "Cluster": "${ECS_CLUSTER_ARN}",
+        "TaskDefinition": "${TASK_DEFINITION_ARN}",
+        "NetworkConfiguration": { "AwsvpcConfiguration": { "Subnets": ["${SUBNET_ID_A}", "${SUBNET_ID_B}"], "SecurityGroups": ["${SECURITY_GROUP_ID}"], "AssignPublicIp": "DISABLED" } },
+        "Overrides": { "ContainerOverrides": [{ "Name": "${CONTAINER_NAME}", "Command": ["JOB3"], "Environment": [{ "Name": "S3_BUCKET", "Value": "${S3_BUCKET}" }, { "Name": "AWS_REGION", "Value": "${AWS_REGION}" }, { "Name": "S3_PREFIX", "Value.$": "$.config.testRunPrefix" }] }] }
+      },
+      "Retry": [{ "ErrorEquals": ["ECS.AmazonECSException", "ECS.ServerException", "States.Timeout"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "BatchJobExecutionFailed", "ResultPath": "$.error" }],
+      "ResultPath": "$.job3EcsResult",
+      "Next": "EvaluateJOB3ExitCode"
+    },
+    "EvaluateJOB3ExitCode": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.job3EcsResult.Containers[0].ExitCode", "NumericEquals": 0, "Next": "AllTasksCompleted" }],
+      "Default": "BatchJobExecutionFailed"
+    },
+
+    "AllTasksCompleted": { "Type": "Succeed" },
+
+    "FilesNotPresent": {
+      "Type": "Fail",
+      "Error": "InputFilesNotPresent",
+      "Cause": "Required input files are missing or older than the allowed age. See the file-check Lambda result in the execution history."
+    },
+    "BatchJobExecutionFailed": {
+      "Type": "Fail",
+      "Error": "BatchJobFailed",
+      "Cause": "An ECS batch task exited with a non-zero code or failed to run."
+    },
+    "LambdaExecutionError": {
+      "Type": "Fail",
+      "Error": "LambdaInvocationError",
+      "Cause": "The file-check or calendar-check Lambda failed to execute (infrastructure error, not a missing-file result)."
+    }
+  }
+}

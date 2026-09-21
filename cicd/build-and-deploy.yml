@@ -1,0 +1,109 @@
+# CI/CD skeleton — build the image, package artifacts, deploy the CFN stacks in
+# order, then gate promotion by running the full orchestrator against an isolated
+# test prefix. Uses OIDC to assume a deploy role (no long-lived keys). Fill <...>
+# placeholders.
+name: batch-orchestrator-deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+  ENV_NAME: dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: arn:aws:iam::<account-id>:role/<github-deploy-role>
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --- 1. Foundation, IAM (idempotent; safe to re-run) --------------------
+      - name: Deploy foundation + IAM
+        run: |
+          # Foundation scopes task egress to the regional S3 managed prefix list.
+          PLID=$(aws ec2 describe-managed-prefix-lists \
+            --filters Name=prefix-list-name,Values=com.amazonaws.$AWS_REGION.s3 \
+            --query 'PrefixLists[0].PrefixListId' --output text)
+          aws cloudformation deploy --stack-name batch-$ENV_NAME-foundation \
+            --template-file iac/00-foundation.yaml \
+            --parameter-overrides EnvName=$ENV_NAME S3PrefixListId=$PLID
+          aws cloudformation deploy --stack-name batch-$ENV_NAME-iam \
+            --template-file iac/10-iam.yaml \
+            --parameter-overrides EnvName=$ENV_NAME \
+            --capabilities CAPABILITY_IAM
+
+      # --- 2. Build + push the single container image ------------------------
+      - name: Build and push image
+        id: image
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REPO=$ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/batch-stub
+          aws ecr describe-repositories --repository-names batch-stub \
+            || aws ecr create-repository --repository-name batch-stub
+          aws ecr get-login-password | docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com
+          # Swap runnable-stub for your Blu Age/Gapwalk image build in production.
+          docker build -t $REPO:${{ github.sha }} -t $REPO:latest container/runnable-stub
+          docker push $REPO:${{ github.sha }}
+          docker push $REPO:latest
+          echo "uri=$REPO:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      # --- 3. Package Lambda + ASL artifacts to S3 ---------------------------
+      - name: Package artifacts
+        id: artifacts
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET=batch-artifacts-$ENV_NAME-$ACCOUNT
+          aws s3 mb s3://$BUCKET --region $AWS_REGION || true
+          ( cd lambda/file_check && zip -qr /tmp/file_check.zip lambda_function.py )
+          ( cd lambda/calendar_check && zip -qr /tmp/calendar_check.zip lambda_function.py )
+          aws s3 cp /tmp/file_check.zip s3://$BUCKET/lambda/file_check.zip
+          aws s3 cp /tmp/calendar_check.zip s3://$BUCKET/lambda/calendar_check.zip
+          aws s3 cp statemachine/ s3://$BUCKET/statemachine/ --recursive
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      # --- 4. ECS, Lambda, Step Functions, observability ---------------------
+      - name: Deploy application stacks
+        run: |
+          aws cloudformation deploy --stack-name batch-$ENV_NAME-ecs \
+            --template-file iac/20-ecs.yaml \
+            --parameter-overrides EnvName=$ENV_NAME ContainerImage=${{ steps.image.outputs.uri }}
+          aws cloudformation deploy --stack-name batch-$ENV_NAME-lambda \
+            --template-file iac/30-lambda.yaml \
+            --parameter-overrides EnvName=$ENV_NAME LambdaCodeBucket=${{ steps.artifacts.outputs.bucket }} \
+            --capabilities CAPABILITY_IAM
+          aws cloudformation deploy --stack-name batch-$ENV_NAME-statemachine \
+            --template-file iac/40-statemachine.yaml \
+            --parameter-overrides EnvName=$ENV_NAME DefinitionBucket=${{ steps.artifacts.outputs.bucket }}
+          aws cloudformation deploy --stack-name batch-$ENV_NAME-observability \
+            --template-file iac/50-observability.yaml \
+            --parameter-overrides EnvName=$ENV_NAME OpsEmail=batch-ops@example.com
+
+      # --- 5. Regression gate: promotion blocks if the test run fails --------
+      - name: Regression test gate
+        run: |
+          SM=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='batch-$ENV_NAME-statemachine-arn'].Value" --output text)
+          TEST_ID=ci-${{ github.run_id }}
+          # Upload known-good inputs under an isolated prefix, then run.
+          aws s3 cp sample-data/inbound/ \
+            s3://batch-data-$ENV_NAME-$(aws sts get-caller-identity --query Account --output text)/test-runs/$TEST_ID/inbound/ --recursive
+          EXEC=$(aws stepfunctions start-execution --state-machine-arn $SM \
+            --input "{\"testRunPrefix\":\"test-runs/$TEST_ID/\"}" --query executionArn --output text)
+          while true; do
+            STATUS=$(aws stepfunctions describe-execution --execution-arn $EXEC --query status --output text)
+            [ "$STATUS" != "RUNNING" ] && break
+            sleep 10
+          done
+          echo "Regression status: $STATUS"
+          [ "$STATUS" = "SUCCEEDED" ] || { echo "Regression failed — blocking promotion"; exit 1; }

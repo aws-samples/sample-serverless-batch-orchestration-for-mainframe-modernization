@@ -1,0 +1,104 @@
+{
+  "Comment": "Regression harness. Runs one or many jobs generically against an isolated testRunPrefix using a Map state. Intended for CI/CD to exercise individual modules after a deployment. Modules run concurrently (no ordering), so drive it per-module or with already-present inputs. Input: { \"testRunPrefix\": \"test-runs/<id>/\", \"modules\": [\"JOB1\",\"JOB2A\"] }.",
+  "StartAt": "SetDefaults",
+  "States": {
+    "SetDefaults": {
+      "Type": "Pass",
+      "Parameters": {
+        "defaults": { "testRunPrefix": "", "modules": [] },
+        "executionInput.$": "$$.Execution.Input"
+      },
+      "ResultPath": "$.init",
+      "Next": "MergeDefaults"
+    },
+    "MergeDefaults": {
+      "Type": "Pass",
+      "Parameters": { "merged.$": "States.JsonMerge($.init.defaults, $.init.executionInput, false)" },
+      "ResultPath": "$.init",
+      "Next": "ExtractConfig"
+    },
+    "ExtractConfig": {
+      "Type": "Pass",
+      "Parameters": {
+        "testRunPrefix.$": "$.init.merged.testRunPrefix",
+        "modules.$": "$.init.merged.modules"
+      },
+      "ResultPath": "$.config",
+      "Next": "RunModuleECSTasks"
+    },
+    "RunModuleECSTasks": {
+      "Type": "Map",
+      "ItemsPath": "$.config.modules",
+      "MaxConcurrency": 3,
+      "Comment": "MaxConcurrency caps simultaneous ECS tasks - the direct equivalent of a Control-M quantitative resource pool count.",
+      "Parameters": {
+        "module.$": "$$.Map.Item.Value",
+        "testRunPrefix.$": "$.config.testRunPrefix"
+      },
+      "Iterator": {
+        "StartAt": "CheckModuleInputFiles",
+        "States": {
+          "CheckModuleInputFiles": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${INPUT_FILE_CHECK_LAMBDA}",
+              "Payload": {
+                "jobName.$": "States.Format('Check_{}_Input_Files', $.module)",
+                "module.$": "$.module",
+                "testRunPrefix.$": "$.testRunPrefix"
+              }
+            },
+            "Retry": [{ "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+            "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ModuleLambdaExecutionFailed", "ResultPath": "$.error" }],
+            "ResultPath": "$.moduleInputChecks",
+            "Next": "EvaluateModuleFiles"
+          },
+          "EvaluateModuleFiles": {
+            "Type": "Choice",
+            "Choices": [{ "Variable": "$.moduleInputChecks.Payload.allFilesPresent", "BooleanEquals": true, "Next": "RunModuleECSTask" }],
+            "Default": "ModuleInputFilesNotPresent"
+          },
+          "RunModuleECSTask": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::ecs:runTask.sync",
+            "TimeoutSeconds": 7200,
+            "Parameters": {
+              "LaunchType": "FARGATE",
+              "Cluster": "${ECS_CLUSTER_ARN}",
+              "TaskDefinition": "${TASK_DEFINITION_ARN}",
+              "NetworkConfiguration": { "AwsvpcConfiguration": { "Subnets": ["${SUBNET_ID_A}", "${SUBNET_ID_B}"], "SecurityGroups": ["${SECURITY_GROUP_ID}"], "AssignPublicIp": "DISABLED" } },
+              "Overrides": {
+                "ContainerOverrides": [{
+                  "Name": "${CONTAINER_NAME}",
+                  "Command.$": "States.Array($.module)",
+                  "Environment": [
+                    { "Name": "S3_BUCKET", "Value": "${S3_BUCKET}" },
+                    { "Name": "AWS_REGION", "Value": "${AWS_REGION}" },
+                    { "Name": "S3_PREFIX", "Value.$": "$.testRunPrefix" }
+                  ]
+                }]
+              }
+            },
+            "Retry": [{ "ErrorEquals": ["ECS.AmazonECSException", "ECS.ServerException", "States.Timeout"], "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 1, "JitterStrategy": "FULL" }],
+            "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ModuleBatchJobExecutionFailed", "ResultPath": "$.error" }],
+            "ResultPath": "$.moduleEcsResult",
+            "Next": "EvaluateModuleExitCode"
+          },
+          "EvaluateModuleExitCode": {
+            "Type": "Choice",
+            "Choices": [{ "Variable": "$.moduleEcsResult.Containers[0].ExitCode", "NumericEquals": 0, "Next": "ModuleTaskCompleted" }],
+            "Default": "ModuleBatchJobExecutionFailed"
+          },
+          "ModuleTaskCompleted": { "Type": "Succeed" },
+          "ModuleInputFilesNotPresent": { "Type": "Fail", "Error": "InputFilesNotPresent", "Cause": "Module input files missing or stale." },
+          "ModuleBatchJobExecutionFailed": { "Type": "Fail", "Error": "BatchJobFailed", "Cause": "Module ECS task failed or exited non-zero." },
+          "ModuleLambdaExecutionFailed": { "Type": "Fail", "Error": "LambdaInvocationError", "Cause": "File-check Lambda failed for this module." }
+        }
+      },
+      "ResultPath": "$.moduleResults",
+      "Next": "AllTasksCompleted"
+    },
+    "AllTasksCompleted": { "Type": "Succeed" }
+  }
+}

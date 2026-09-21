@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Batch orchestration - Lambdas. File-check (regex + freshness) and
+  calendar-check (business-day gate). Code is uploaded by the deploy script and
+  referenced from S3 (see README.md and cicd/build-and-deploy.yml).
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket holding the packaged Lambda zips.
+  FileCheckKey:
+    Type: String
+    Default: lambda/file_check.zip
+  CalendarCheckKey:
+    Type: String
+    Default: lambda/calendar_check.zip
+  MaxAgeDays:
+    Type: String
+    Default: '2'
+  ScheduleTimezone:
+    Type: String
+    Default: UTC
+    Description: >
+      Must match the EventBridge ScheduleTimezone in iac/40-statemachine.yaml. The
+      calendar-check resolves the UTC StartTime to this zone before the weekend/
+      holiday test, so a non-UTC schedule evaluates the correct local business date.
+
+Resources:
+  FileCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub batch-${EnvName}-file-check
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 2
+      Role: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-lambda-role' }
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref FileCheckKey
+      Environment:
+        Variables:
+          S3_BUCKET: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-bucket' }
+          MAX_AGE_DAYS: !Ref MaxAgeDays
+
+  CalendarCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub batch-${EnvName}-calendar-check
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 15
+      MemorySize: 128
+      ReservedConcurrentExecutions: 2
+      Role: !ImportValue { 'Fn::Sub': 'batch-${EnvName}-lambda-role' }
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref CalendarCheckKey
+      Environment:
+        Variables:
+          # Keep in sync with the schedule's timezone so the local business date is used.
+          SCHEDULE_TIMEZONE: !Ref ScheduleTimezone
+      # Set CALENDAR_TABLE to enable the DynamoDB holiday lookup (optional).
+
+Outputs:
+  FileCheckArn:
+    Value: !GetAtt FileCheckFunction.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-file-check-arn' }
+  CalendarCheckArn:
+    Value: !GetAtt CalendarCheckFunction.Arn
+    Export: { Name: !Sub 'batch-${EnvName}-calendar-check-arn' }
